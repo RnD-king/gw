@@ -1,0 +1,460 @@
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+import easyocr
+import requests
+import time
+import threading
+
+from PIL import Image, ImageDraw, ImageFont
+from queue import Queue, Empty
+
+DEEPL_API_KEY = "" # DeepL API키를 입력하면 됩니다. 개인정보...
+
+CANNY_LOW  = 50
+CANNY_HIGH = 150
+MIN_AREA = 20000
+MAX_AREA = 200000
+OCR_INTERVAL = 0.5
+missing_frame_count = 0 
+MAX_MISSING_FRAMES = 5
+
+translate_queue = Queue()
+translation = {}
+requested_texts  = set()
+
+
+def translate(text_eng: str):
+    if not text_eng.strip():
+        return "(텍스트 없음)"
+
+    url = "https://api-free.deepl.com/v2/translate"
+    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
+    data = {"text": text_eng, "source_lang": "EN", "target_lang": "KO"}
+
+    try:
+        r = requests.post(url, headers=headers, data=data, timeout=5.0) 
+        r.raise_for_status()
+        j = r.json()
+        t = j.get("translations", [])
+        if not t:
+            print(f"[ERROR] No translation found for: {text_eng[:30]}...")
+            return "(번역 결과 없음)"
+        return t[0].get("text", "(번역 오류)")
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Request failed for '{text_eng[:30]}...': {e}")
+        return "(번역 오류)"
+    except Exception as e:
+        print(f"[ERROR] Unexpected error occurred: {e}")
+        return "(번역 오류)"
+
+
+def translate_thread():
+    global translation
+    while True:
+        try:
+            text_eng = translate_queue.get(timeout=1)
+        except Empty:
+            continue
+        
+        trans = translate(text_eng)
+        translation[text_eng] = trans
+        translate_queue.task_done()
+
+threading.Thread(target=translate_thread, daemon=True).start()
+
+def order_points(pts):
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def warp_quad(image, quad):
+    pts = quad.reshape(4, 2).astype(np.float32)
+    rect = order_points(pts)
+
+    (tl, tr, br, bl) = rect
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxW = int(max(widthA, widthB))
+
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxH = int(max(heightA, heightB))
+    maxW = max(maxW, 40)
+    maxH = max(maxH, 40)
+
+    dst = np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxW, maxH))
+
+    return warped, M, rect, dst
+
+def group_words(results):
+    if len(results) == 0:
+        return []
+
+    words = []
+    for r in results:
+        bbox, text, _ = r
+        pts = np.array(bbox)
+
+        top_y = int((pts[0][1] + pts[1][1]) / 2)
+        min_x = int(np.min(pts[:,0]))
+        words.append((min_x, top_y, bbox, text))
+    words.sort(key=lambda x: x[1])
+
+    clusters = []
+    current = [words[0]]
+
+    for i in range(1, len(words)):
+        prev = current[-1]
+        curr = words[i]
+
+        if abs(prev[1] - curr[1]) < 20:
+            if abs(prev[0] - curr[0]) < 130:
+                current.append(curr)
+            else:
+                clusters.append(current)
+                current = [curr]
+        else:
+            clusters.append(current)
+            current = [curr]
+
+    clusters.append(current)
+    for c in clusters:
+        c.sort(key=lambda x: x[0])
+
+    return clusters
+
+def create_overlay(h, w, word_states, warped_img):
+    overlay = np.ones((h, w, 3), dtype=np.uint8) * 255
+    pil_img = Image.fromarray(overlay)
+    draw = ImageDraw.Draw(pil_img)
+
+    for key, st in word_states.items():
+        kor = st["kor"]
+        bbox = np.array(st["bbox"])
+
+        min_x = int(np.min(bbox[:,0]))
+        max_x = int(np.max(bbox[:,0]))
+        min_y = int(np.min(bbox[:,1]))
+        max_y = int(np.max(bbox[:,1]))
+        
+        text_roi = warped_img[min_y:max_y, min_x:max_x] 
+
+        if text_roi.size > 0:
+            gray_roi = cv2.cvtColor(text_roi, cv2.COLOR_BGR2GRAY)
+            avg_brightness = np.mean(gray_roi)
+        else:
+            avg_brightness = 128
+        if avg_brightness > 30:
+            text_color = (0, 0, 0)  
+        else:
+            text_color = (255, 255, 255)
+
+        height = max_y - min_y
+        if height < 5:
+            height = 5
+
+        font_size = int(height * 0.5)
+        font_size = max(font_size, 10) 
+        
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",font_size)
+        except:
+            font = ImageFont.load_default()
+
+        text_y = min(max_y + int(height * 0.5), h - height) 
+
+        text = kor
+        tb = draw.textbbox((0,0), text, font=font)
+        tw = tb[2] - tb[0]
+
+        text_x = min_x + (max_x - min_x)//2 - tw//2
+
+        draw.text((text_x, text_y), text, fill=text_color, font=font)
+
+    return np.array(pil_img)
+
+def select_and_translate_roi(frame, reader):  # ROI 만들기
+
+    temp_frame = frame.copy()
+    cv2.namedWindow("ROI")
+    ret = cv2.selectROI("ROI", temp_frame)
+    cv2.destroyWindow("ROI") 
+    x, y, w, h = ret
+    
+    if w > 0 and h > 0:
+        roi_img = frame[int(y):int(y+h), int(x):int(x+w)]
+        roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        
+        results = reader.readtext(roi_gray, detail=1) 
+        
+        if not results:
+            print("[OCR] No text found in ROI.")
+            return
+
+        clusters = group_words(results) 
+        all_eng_sentences = []
+        for cluster in clusters:
+            full_eng = " ".join([word[3] for word in cluster]).strip()
+            if full_eng:
+                all_eng_sentences.append(full_eng)
+                
+        full_eng_text = "\n".join(all_eng_sentences)
+        if not full_eng_text:
+            kor_translation = "(텍스트 없음)"
+        else:
+            print("[OCR] Found: '{}'".format(full_eng_text.replace('\n', ' ')))
+            kor_translation = translate(full_eng_text)
+        kor_lines = kor_translation.split('\n')
+        
+        h_orig, w_orig = roi_img.shape[:2]        
+        scale = 1.0
+        
+        if w_orig < 360 or h_orig < 360:
+            scale_w = 360 / w_orig
+            scale_h = 360 / h_orig
+            scale = max(scale_w, scale_h) 
+
+            new_w = int(w_orig * scale)
+            new_h = int(h_orig * scale)
+            
+            resized_roi_img = cv2.resize(roi_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            resized_roi_img = roi_img.copy()
+        
+        pil_roi_img = Image.fromarray(cv2.cvtColor(resized_roi_img, cv2.COLOR_BGR2RGB)).convert('RGBA')
+
+        overlay_layer = Image.new('RGBA', pil_roi_img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay_layer)
+
+        for i, cluster in enumerate(clusters):
+            kor_text = kor_lines[i] if i < len(kor_lines) else "(번역 오류)"
+            
+            all_pts = []
+            for _, _, bbox, _ in cluster:
+                all_pts.extend(bbox)
+            all_pts = np.array(all_pts)
+            
+            orig_min_x = int(np.min(all_pts[:, 0]))
+            orig_max_x = int(np.max(all_pts[:, 0]))
+            orig_min_y = int(np.min(all_pts[:, 1]))
+            orig_max_y = int(np.max(all_pts[:, 1]))
+            
+            scaled_min_x = int(orig_min_x * scale)
+            scaled_max_x = int(orig_max_x * scale)
+            scaled_min_y = int(orig_min_y * scale)
+            scaled_max_y = int(orig_max_y * scale)
+            
+            draw.rectangle([
+                (scaled_min_x - 5, scaled_min_y - 5), 
+                (scaled_max_x + 5, scaled_max_y + 5)
+            ], fill=(0, 0, 0, 180)) 
+            
+            bbox_height = scaled_max_y - scaled_min_y
+            current_font_size = int(bbox_height * 0.4) 
+            current_font_size = max(current_font_size, 15)
+            
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", current_font_size)
+            except:
+                font = ImageFont.load_default()
+
+            tb = draw.textbbox((0, 0), kor_text, font=font)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+            
+            text_pos_x = scaled_min_x + (scaled_max_x - scaled_min_x) // 2 - tw // 2
+            text_pos_y = scaled_min_y + (scaled_max_y - scaled_min_y) // 2 - th // 2
+            
+            draw.text((text_pos_x, text_pos_y), kor_text, fill=(255, 255, 255), font=font)
+
+        pil_roi_img = Image.alpha_composite(pil_roi_img, overlay_layer)
+        
+        result_img_cv = cv2.cvtColor(np.array(pil_roi_img), cv2.COLOR_RGBA2BGR)
+
+        cv2.namedWindow("Translation Result", cv2.WINDOW_AUTOSIZE)
+        cv2.imshow("Translation Result", result_img_cv)
+        cv2.waitKey(0) 
+        cv2.destroyWindow("Translation Result")
+        cv2.destroyWindow("ROI")
+
+def main():
+    global missing_frame_count, MAX_MISSING_FRAMES
+    
+    reader = easyocr.Reader(['en'])
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    pipeline.start(config)
+    print("RealSense started")
+
+    last_overlay = None
+    last_mask = None
+    last_ocr_time = 0.0
+
+    while True:
+        frames = pipeline.wait_for_frames()
+        f = frames.get_color_frame()
+        if not f:
+            continue
+
+        frame = np.asanyarray(f.get_data())
+        output = frame.copy()
+        h, w = frame.shape[:2]
+        now = time.time()
+
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g = clahe.apply(g)
+        g_blur = cv2.GaussianBlur(g, (5,5), 0)
+        edges = cv2.Canny(g_blur, CANNY_LOW, CANNY_HIGH)
+        kernel = np.ones((5,5), np.uint8)
+        edges = cv2.dilate(edges, kernel, 1)
+        edges = cv2.erode(edges, kernel, 1)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        quads = []
+
+        for cnt in contours:
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
+
+            if len(approx) == 4:
+                if not cv2.isContourConvex(approx):
+                    continue
+                area = cv2.contourArea(approx)
+                if area < MIN_AREA or area > MAX_AREA:
+                    continue
+                hull = cv2.convexHull(cnt)
+                hull_area = cv2.contourArea(hull)
+                if hull_area == 0:
+                    continue
+                solidity = float(area) / hull_area
+                if solidity < 0.8:
+                    continue
+                x,y,w2,h2 = cv2.boundingRect(approx)
+                asp = w2/float(h2)
+                if 0.4 < asp < 2.0:
+                    quads.append(approx)
+
+        mask = None
+
+        if len(quads) > 0:
+            missing_frame_count = 0 
+            
+            mask = np.zeros((h, w), np.uint8)
+            for q in quads:
+                cv2.fillConvexPoly(mask, q.reshape(4,2), 255)
+        
+        else:
+            missing_frame_count += 1
+            
+            if missing_frame_count > MAX_MISSING_FRAMES:
+                last_mask = None
+                last_overlay = None
+
+        if mask is not None and (now - last_ocr_time) > OCR_INTERVAL:
+            overlay_total = np.zeros_like(frame, dtype=np.uint8)
+            all_texts = []
+
+            for quad in quads:
+                warped, M, src, dst = warp_quad(frame, quad)
+                warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
+                results = reader.readtext(warped_gray, detail=1)
+
+                clusters = group_words(results)
+                local_states = {}
+                state_idx = 0
+
+                for cluster in clusters:
+                    full_eng = " ".join([word[3] for word in cluster]).strip()
+                    if not full_eng:
+                        continue
+
+                    all_texts.append(full_eng)
+                    pts_all = []
+                    for word in cluster:
+                        pts_all.extend(word[2])
+                    pts_all = np.array(pts_all)
+
+                    bbox_sentence = [
+                        [int(np.min(pts_all[:,0])), int(np.min(pts_all[:,1]))],
+                        [int(np.max(pts_all[:,0])), int(np.min(pts_all[:,1]))],
+                        [int(np.max(pts_all[:,0])), int(np.max(pts_all[:,1]))],
+                        [int(np.min(pts_all[:,0])), int(np.max(pts_all[:,1]))]
+                    ]
+
+                    kor = translation.get(full_eng)
+                    if kor is None:
+                        kor = "(번역 대기중)"
+                        if full_eng not in requested_texts:
+                            translate_queue.put(full_eng)
+                            requested_texts.add(full_eng)
+
+                    state = {
+                        "eng": full_eng,
+                        "kor": kor,
+                        "bbox": bbox_sentence
+                    }
+                    local_states[state_idx] = state
+                    state_idx += 1
+
+                if len(local_states) > 0:
+                    warp_h, warp_w = warped.shape[:2]
+                    warped_overlay = create_overlay(warp_h, warp_w, local_states, warped)
+
+                    Minv = cv2.getPerspectiveTransform(dst, src)
+                    ov = cv2.warpPerspective(warped_overlay, Minv, (w, h))
+
+                    overlay_total = np.maximum(overlay_total, ov)
+
+            if all_texts:
+                print("[OCR]", " | ".join(all_texts))
+            else:
+                print("[OCR] no text")
+
+            last_overlay = overlay_total
+            last_mask = mask
+            last_ocr_time = now
+
+        if last_overlay is not None and last_mask is not None:
+            mask_frame = mask.reshape(mask.shape[0], mask.shape[1], 1)
+            out_frame = output.astype(np.float32)
+            ov_frame = last_overlay.astype(np.float32)
+
+            output = out_frame*(1 - mask_frame*0.3) + ov_frame*(mask_frame*0.3)
+            output = output.astype(np.uint8)
+
+        for q in quads:
+            cv2.drawContours(output, [q], -1, (0,255,0), 3)
+
+        cv2.imshow("Translator", output)
+        cv2.imshow("Edges", edges)
+
+        k = cv2.waitKey(1)&0xFF
+        if k in [27, ord('q')]:
+            break
+        
+        if k == ord('s'):
+            frame_to_process = frame.copy() 
+            roi_thread = threading.Thread(
+                target=select_and_translate_roi, 
+                args=(frame_to_process, reader), 
+                daemon=True 
+            )
+            roi_thread.start()
+    pipeline.stop()
+    cv2.destroyAllWindows()
+
+if __name__=="__main__":
+    main()
