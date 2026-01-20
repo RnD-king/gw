@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 축 안 맞는다 지금
 import math
 import numpy as np
 
@@ -8,6 +9,19 @@ from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Vector3Stamped
+
+kTicksPerRev = 4096
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def wrap_to_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
 
 def normalize(v: np.ndarray) -> np.ndarray:
@@ -23,16 +37,41 @@ class ImuMahonyNode(Node):
 
         self.declare_parameter('gyro_topic', '/camera/gyro/sample')
         self.declare_parameter('accel_topic', '/camera/accel/sample')
+        self.declare_parameter('gimbal_delta_topic', '/gimbal/delta_tick')
 
         # Mahony 필터 게인
         self.declare_parameter('Kp', 2.0) # Kp ≈ 2π · f_c  >>>>>>>>>>>>> 많이 흔들리는 상황이면 자이로 신뢰도 높이기
         self.declare_parameter('Ki', 0.0)  # Ki ≈ 0.001  <<<< 굳이 필요 X
+        # Gimbal PID/LPF
+        self.declare_parameter('cutoff_hz', 15.0)
+
+        self.declare_parameter('kp_pitch', 1.0)
+        self.declare_parameter('kd_pitch', 0.01)
+        self.declare_parameter('ki_pitch', 0.0)
+
+        self.declare_parameter('kp_yaw', 1.8)
+        self.declare_parameter('kd_yaw', 0.02)
+        self.declare_parameter('ki_yaw', 0.0)
+
+        self.declare_parameter('max_tick_step_pitch', 200)
+        self.declare_parameter('max_tick_step_yaw', 200)
 
         self.gyro_topic = self.get_parameter('gyro_topic').get_parameter_value().string_value
         self.accel_topic = self.get_parameter('accel_topic').get_parameter_value().string_value
+        self.gimbal_delta_topic = self.get_parameter('gimbal_delta_topic').get_parameter_value().string_value
 
         self.Kp = float(self.get_parameter('Kp').value)
         self.Ki = float(self.get_parameter('Ki').value)
+
+        self.cutoff_hz = float(self.get_parameter('cutoff_hz').value)
+        self.kp_pitch = float(self.get_parameter('kp_pitch').value)
+        self.kd_pitch = float(self.get_parameter('kd_pitch').value)
+        self.ki_pitch = float(self.get_parameter('ki_pitch').value)
+        self.kp_yaw = float(self.get_parameter('kp_yaw').value)
+        self.kd_yaw = float(self.get_parameter('kd_yaw').value)
+        self.ki_yaw = float(self.get_parameter('ki_yaw').value)
+        self.max_tick_step_pitch = max(1, int(self.get_parameter('max_tick_step_pitch').value))
+        self.max_tick_step_yaw = max(1, int(self.get_parameter('max_tick_step_yaw').value))
 
         self.use_initial_ref = True
         self.ref_set = False
@@ -58,11 +97,21 @@ class ImuMahonyNode(Node):
         self.last_roll_out = 0.0
         self.last_pitch_out = 0.0
         self.last_yaw_out = 0.0
+        self.pid_initialized = False
+        self.err_pitch_lpf = 0.0
+        self.err_yaw_lpf = 0.0
+        self.prev_pitch_out = 0.0
+        self.prev_yaw_out = 0.0
+        self.err_pitch_integral = 0.0
+        self.err_yaw_integral = 0.0
+        self.loop_count = 0
+        self.loop_dt_accum = 0.0
 
         self.sub_gyro = self.create_subscription(Imu, self.gyro_topic, self.gyro_callback, qos_profile_sensor_data)
         self.sub_accel = self.create_subscription(Imu, self.accel_topic, self.accel_callback, qos_profile_sensor_data)
 
-        self.pub_tilt = self.create_publisher(Vector3Stamped, '/camera/imu_tilt', 10)
+        self.pub_tilt = self.create_publisher(Vector3Stamped, '/gimbal/tilt_rad', 10)
+        self.pub_delta = self.create_publisher(Vector3Stamped, self.gimbal_delta_topic, 10)
 
         self.timer = self.create_timer(1/200, self.update_filter)
 
@@ -70,7 +119,14 @@ class ImuMahonyNode(Node):
 
         self.get_logger().info(
             f'Mahony IMU node started. gyro_topic={self.gyro_topic}, '
-            f'accel_topic={self.accel_topic}, Kp={self.Kp:.3f}, Ki={self.Ki:.3f}'
+            f'accel_topic={self.accel_topic}, Kp={self.Kp:.3f}, Ki={self.Ki:.3f}, '
+            f'gimbal_delta_topic={self.gimbal_delta_topic}'
+        )
+        self.get_logger().info(
+            f'Gimbal PID: cutoff_hz={self.cutoff_hz:.2f}, '
+            f'kp/ki/kd pitch={self.kp_pitch:.3f}/{self.ki_pitch:.3f}/{self.kd_pitch:.3f}, '
+            f'kp/ki/kd yaw={self.kp_yaw:.3f}/{self.ki_yaw:.3f}/{self.kd_yaw:.3f}, '
+            f'max_tick_step(P/Y)={self.max_tick_step_pitch}/{self.max_tick_step_yaw}'
         )
 
     def gyro_callback(self, msg: Imu):
@@ -85,6 +141,12 @@ class ImuMahonyNode(Node):
         roll_deg = math.degrees(self.last_roll_out)
         pitch_deg = math.degrees(self.last_pitch_out)
         yaw_deg = math.degrees(self.last_yaw_out)
+
+        if self.loop_count > 0 and self.loop_dt_accum > 0.0:
+            loop_hz = self.loop_count / self.loop_dt_accum
+            self.get_logger().info(f"[Mahony loop] rate={loop_hz:.1f} Hz")
+            self.loop_count = 0
+            self.loop_dt_accum = 0.0
 
         self.get_logger().info(
             "[Mahony angle vs ref] "
@@ -106,6 +168,8 @@ class ImuMahonyNode(Node):
         self.last_time = now
         if dt <= 0.0 or dt > 0.1:
             return
+        self.loop_count += 1
+        self.loop_dt_accum += dt
 
         gx = self.last_gyro.angular_velocity.x
         gy = self.last_gyro.angular_velocity.y
@@ -223,23 +287,96 @@ class ImuMahonyNode(Node):
             )
 
         if self.ref_set:
-            roll_out = roll - self.roll_ref
-            pitch_out = pitch - self.pitch_ref
-            yaw_out = yaw - self.yaw_ref
+            roll_raw = roll - self.roll_ref
+            pitch_raw = pitch - self.pitch_ref
+            yaw_raw = yaw - self.yaw_ref
         else:
-            roll_out, pitch_out, yaw_out = roll, pitch, yaw
+            roll_raw, pitch_raw, yaw_raw = roll, pitch, yaw
 
-        self.last_roll_out = roll_out
-        self.last_pitch_out = pitch_out
-        self.last_yaw_out = yaw_out
+        self.last_roll_out = roll_raw
+        self.last_pitch_out = pitch_raw
+        self.last_yaw_out = yaw_raw
 
         msg_tilt = Vector3Stamped() # 4. 결과 퍼블리시  >>>>>  초기각 기준 틀어진 각도
         msg_tilt.header.stamp = now.to_msg()
         msg_tilt.header.frame_id = 'camera_link'
-        msg_tilt.vector.x = roll_out
-        msg_tilt.vector.y = pitch_out
-        msg_tilt.vector.z = yaw_out
+        msg_tilt.vector.x = roll_raw
+        msg_tilt.vector.y = pitch_raw
+        msg_tilt.vector.z = yaw_raw
         self.pub_tilt.publish(msg_tilt)
+
+        if not self.ref_set:
+            return
+
+        if not self.pid_initialized:
+            self.prev_pitch_out = pitch_raw
+            self.prev_yaw_out = yaw_raw
+            self.err_pitch_lpf = 0.0
+            self.err_yaw_lpf = 0.0
+            self.err_pitch_integral = 0.0
+            self.err_yaw_integral = 0.0
+            self.pid_initialized = True
+            return
+
+        err_pitch = roll_raw
+        err_yaw = wrap_to_pi(yaw_raw)
+
+        if self.cutoff_hz > 0.0:
+            rc = 1.0 / (2.0 * math.pi * self.cutoff_hz)
+            a = dt / (rc + dt)
+            self.err_pitch_lpf += a * (err_pitch - self.err_pitch_lpf)
+            self.err_yaw_lpf += a * (err_yaw - self.err_yaw_lpf)
+        else:
+            self.err_pitch_lpf = err_pitch
+            self.err_yaw_lpf = err_yaw
+
+        pitch_rate = (pitch_raw - self.prev_pitch_out) / dt
+        yaw_rate = wrap_to_pi(yaw_raw - self.prev_yaw_out) / dt
+        self.prev_pitch_out = pitch_raw
+        self.prev_yaw_out = yaw_raw
+
+        if self.ki_pitch > 0.0:
+            self.err_pitch_integral += self.err_pitch_lpf * dt
+        else:
+            self.err_pitch_integral = 0.0
+
+        if self.ki_yaw > 0.0:
+            self.err_yaw_integral += self.err_yaw_lpf * dt
+        else:
+            self.err_yaw_integral = 0.0
+
+        ticks_per_rad = float(kTicksPerRev) / (2.0 * math.pi)
+        if self.ki_pitch > 0.0:
+            max_pitch_integral = (self.max_tick_step_pitch / ticks_per_rad) / self.ki_pitch
+            self.err_pitch_integral = clamp(self.err_pitch_integral, -max_pitch_integral, +max_pitch_integral)
+        if self.ki_yaw > 0.0:
+            max_yaw_integral = (self.max_tick_step_yaw / ticks_per_rad) / self.ki_yaw
+            self.err_yaw_integral = clamp(self.err_yaw_integral, -max_yaw_integral, +max_yaw_integral)
+
+        cmd_pitch_rad = -(
+            self.kp_pitch * self.err_pitch_lpf
+            + self.kd_pitch * pitch_rate
+            + self.ki_pitch * self.err_pitch_integral
+        )
+        cmd_yaw_rad = -(
+            self.kp_yaw * self.err_yaw_lpf
+            + self.kd_yaw * yaw_rate
+            + self.ki_yaw * self.err_yaw_integral
+        )
+
+        delta_pitch_tick = int(round(cmd_pitch_rad * ticks_per_rad))
+        delta_yaw_tick = int(round(cmd_yaw_rad * ticks_per_rad))
+
+        delta_pitch_tick = int(clamp(delta_pitch_tick, -self.max_tick_step_pitch, +self.max_tick_step_pitch))
+        delta_yaw_tick = int(clamp(delta_yaw_tick, -self.max_tick_step_yaw, +self.max_tick_step_yaw))
+
+        msg_delta = Vector3Stamped()
+        msg_delta.header.stamp = now.to_msg()
+        msg_delta.header.frame_id = 'camera_link'
+        msg_delta.vector.x = 0.0
+        msg_delta.vector.y = float(delta_pitch_tick)
+        msg_delta.vector.z = float(delta_yaw_tick)
+        self.pub_delta.publish(msg_delta)
 
 
 def main():
@@ -252,4 +389,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
